@@ -1,74 +1,112 @@
 #!/usr/bin/env bash
 # =============================================================================
-# MiniCPM-o macOS App - 一键启动脚本
+# MiniCPM-o macOS App — 一键启动 (pybind11 直连版)
 #
-# 目录结构:
-#   llama.cpp-omni/                ← REPO_ROOT
-#   ├── .venv/base/                ← Python venv
-#   ├── build/bin/omni_engine.so   ← pybind11 模块
-#   └── tools/omni/
-#       ├── app/                   ← 本脚本所在
-#       │   └── server.py
-#       └── models/                ← GGUF/CoreML 模型
+# 从任意目录执行均可:
+#   bash /path/to/llama.cpp-omni/tools/omni/app/run.sh --simplex
+#   bash /path/to/llama.cpp-omni/tools/omni/app/run.sh --duplex
 #
-# 用法：
-#   cd llama.cpp-omni && bash tools/omni/app/run.sh
-#   bash tools/omni/app/run.sh --duplex
-#   bash tools/omni/app/run.sh --simplex --port 9060
+# 自动处理: 模型检查 → venv 创建 → 依赖安装 → pybind11 模块编译 → 启动服务
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# app/ -> omni/ -> tools/ -> llama.cpp-omni/
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-VENV_DIR="$REPO_ROOT/.venv/base"
-PYTHON="$VENV_DIR/bin/python"
-PIP="$VENV_DIR/bin/pip"
-PORT="${PORT:-9060}"
+# 从脚本位置计算项目根目录，立即 cd
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
 
-# 解析命令行参数中的 --port
-EXTRA_ARGS=("$@")
-for i in "${!EXTRA_ARGS[@]}"; do
-  if [[ "${EXTRA_ARGS[$i]}" == "--port" ]] && [[ $((i+1)) -lt ${#EXTRA_ARGS[@]} ]]; then
-    PORT="${EXTRA_ARGS[$((i+1))]}"
-  fi
+VENV="${REPO_ROOT}/.venv/base"
+MODEL_DIR="tools/omni/models"
+LLM_MODEL="${MODEL_DIR}/MiniCPM-o-4_5-Q4_K_M.gguf"
+TTS_DIR="${MODEL_DIR}/tts"
+REF_AUDIO="tools/omni/assets/default_ref_audio/default_ref_audio.wav"
+
+# 解析 --port
+PORT=9060
+for arg in "$@"; do
+    if [[ "${prev_arg:-}" == "--port" ]]; then PORT="$arg"; fi
+    prev_arg="$arg"
 done
 
 echo ""
 echo "============================================"
-echo "  MiniCPM-o macOS App Launcher"
+echo "  MiniCPM-o App (pybind11 直连)"
 echo "============================================"
-echo "  REPO_ROOT: $REPO_ROOT"
+echo "  REPO_ROOT: ${REPO_ROOT}"
 echo ""
 
-# ---------- 1. 创建 venv ----------
-if [ ! -f "$PYTHON" ]; then
-  echo "[1/3] Creating Python virtual environment..."
-  mkdir -p "$(dirname "$VENV_DIR")"
-  python3 -m venv "$VENV_DIR"
-  echo "  -> $VENV_DIR"
+# ==================== 1. 检查模型 ====================
+
+MISSING=""
+[ ! -f "${LLM_MODEL}" ] && MISSING="${MISSING}\n  - LLM 主模型: ${REPO_ROOT}/${LLM_MODEL}"
+[ ! -d "${TTS_DIR}" ]    && MISSING="${MISSING}\n  - TTS 模型目录: ${REPO_ROOT}/${TTS_DIR}/"
+[ ! -f "${REF_AUDIO}" ]  && MISSING="${MISSING}\n  - 参考音频: ${REPO_ROOT}/${REF_AUDIO}"
+
+if [ -n "${MISSING}" ]; then
+    echo "[ERROR] 缺少以下模型/资源文件:"
+    echo -e "${MISSING}"
+    echo ""
+    echo "模型目录结构:"
+    echo "  tools/omni/"
+    echo "  ├── models/"
+    echo "  │   ├── MiniCPM-o-4_5-Q4_K_M.gguf    # LLM 主模型 (~5GB)"
+    echo "  │   ├── tts/                           # TTS 模型"
+    echo "  │   └── token2wav/                     # Token2Wav 模型"
+    echo "  └── assets/default_ref_audio/"
+    echo "      └── default_ref_audio.wav          # 参考音频"
+    exit 1
+fi
+echo "[1/3] 模型检查通过"
+
+# ==================== 2. venv + 依赖 ====================
+
+if [ ! -d "${VENV}" ]; then
+    echo "[2/3] 创建 venv: ${VENV}"
+    python3 -m venv "${VENV}"
+    echo "  安装依赖..."
+    "${VENV}/bin/pip" install --quiet --upgrade pip
+    "${VENV}/bin/pip" install --quiet pybind11 numpy fastapi uvicorn
 else
-  echo "[1/3] Virtual environment found: $VENV_DIR"
+    echo "[2/3] venv 已存在"
+    "${VENV}/bin/pip" install --quiet pybind11 numpy fastapi uvicorn 2>/dev/null || true
 fi
 
-# ---------- 2. 安装依赖 ----------
-echo "[2/3] Installing dependencies..."
-"$PIP" install --quiet --upgrade pip
-"$PIP" install --quiet pybind11 numpy fastapi uvicorn
-echo "  -> Dependencies OK"
+PYTHON="${VENV}/bin/python"
 
-# ---------- 3. 启动服务 ----------
-echo "[3/3] Starting server..."
+# ==================== 3. 编译 omni_engine ====================
+
+# 查找 omni_engine.so (文件名含 cpython 版本后缀)
+OMNI_SO=$(find build/bin -name "omni_engine*.so" 2>/dev/null | head -1)
+
+if [ -z "${OMNI_SO}" ]; then
+    echo "[3/3] omni_engine.so 未编译，自动编译中（首次约 3-5 分钟）..."
+    cmake -B build -DGGML_METAL=ON -DBUILD_PYBIND=ON \
+        -DPython3_EXECUTABLE="${PYTHON}" -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j 8 --target omni_engine
+    OMNI_SO=$(find build/bin -name "omni_engine*.so" 2>/dev/null | head -1)
+    if [ -z "${OMNI_SO}" ]; then
+        echo "[ERROR] 编译失败，未找到 omni_engine.so"
+        exit 1
+    fi
+    echo "  编译完成: ${OMNI_SO}"
+else
+    echo "[3/3] omni_engine 已编译: ${OMNI_SO}"
+fi
+
+# ==================== 启动服务 ====================
+
+echo ""
+echo "============================================"
+echo "  启动服务 (port=${PORT})"
+echo "  Ctrl+C 退出"
+echo "============================================"
 echo ""
 
-# 2秒后自动打开浏览器
-(
-  sleep 3
-  if command -v open &>/dev/null; then
-    open "http://localhost:$PORT"
-  elif command -v xdg-open &>/dev/null; then
-    xdg-open "http://localhost:$PORT"
-  fi
-) &
+# 清理旧进程
+lsof -ti:${PORT} | xargs kill -9 2>/dev/null || true
+sleep 1
 
-cd "$REPO_ROOT" && PYTHONPATH=. exec "$PYTHON" tools/omni/app/server.py --port "$PORT" "$@"
+# 自动打开浏览器
+(sleep 3 && open "http://localhost:${PORT}" 2>/dev/null || true) &
+
+PYTHONPATH=. exec "${PYTHON}" tools/omni/app/server.py --port "${PORT}" "$@"

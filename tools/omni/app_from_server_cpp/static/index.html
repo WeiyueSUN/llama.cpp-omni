@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniCPM-o Demo (server.cpp)</title>
+<style>
+  :root { --bg: #1a1a2e; --card: #16213e; --accent: #0f3460; --highlight: #e94560; --text: #eee; --muted: #888; --green: #4ecca3; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh;
+         display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.3rem; font-weight: 500; }
+  .subtitle { color: var(--muted); font-size: 0.8rem; margin-bottom: 1.5rem; }
+  .container { width: 100%; max-width: 640px; }
+
+  /* 状态栏 */
+  #status { text-align: center; color: var(--muted); font-size: 0.9rem; margin-bottom: 1rem; min-height: 1.2em; }
+
+  /* 按钮 */
+  .btn-wrap { display: flex; justify-content: center; margin-bottom: 1.5rem; gap: 0.8rem; flex-wrap: wrap; }
+  button { background: var(--card); color: var(--text); border: 1px solid #333;
+           padding: 0.7rem 1.5rem; border-radius: 8px; cursor: pointer; font-size: 0.95rem;
+           transition: all 0.15s; }
+  button:hover { border-color: var(--highlight); }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.recording { background: var(--highlight); border-color: var(--highlight); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+
+  /* 对话区 */
+  .chat { background: var(--card); border-radius: 12px; padding: 1.2rem; min-height: 200px;
+          max-height: 60vh; overflow-y: auto; white-space: pre-wrap; line-height: 1.6;
+          font-size: 0.95rem; margin-bottom: 1rem; }
+  .chat .user { color: #4fc3f7; margin-bottom: 0.3rem; }
+  .chat .assistant { color: var(--text); margin-bottom: 0.8rem; }
+  .chat .system { color: var(--muted); font-size: 0.85rem; font-style: italic; margin-bottom: 0.5rem; }
+
+  /* 统计 */
+  .stats { display: flex; gap: 1rem; justify-content: center; color: var(--muted); font-size: 0.85rem; flex-wrap: wrap; }
+  .stats span { background: var(--card); padding: 0.4rem 0.8rem; border-radius: 6px; }
+
+  /* 音频进度 */
+  #audioProgress { text-align: center; color: var(--green); font-size: 0.85rem; margin-bottom: 0.8rem; min-height: 1.2em; }
+</style>
+</head>
+<body>
+
+<h1>MiniCPM-o 语音对话</h1>
+<div class="subtitle">via server.cpp backend (文本实时流 + 音频渐进加载)</div>
+<div class="container">
+  <div id="status">正在连接后端...</div>
+
+  <div class="btn-wrap">
+    <button id="btnInit">初始化引擎</button>
+    <button id="btnRecord" disabled>录音</button>
+    <button id="btnStop" disabled>发送</button>
+    <!-- 打断功能受 server.cpp octx_mutex 限制，无法即时中断 decode，暂不启用 -->
+    <!-- <button id="btnAbort" disabled style="background:var(--highlight);border-color:var(--highlight);">打断</button> -->
+    <button id="btnReset" disabled>新对话</button>
+  </div>
+
+  <div class="chat" id="chat"></div>
+  <div id="audioProgress"></div>
+
+  <div class="stats">
+    <span>文本首响: <b id="statTTFT">-</b></span>
+    <span>文本完成: <b id="statTextDone">-</b></span>
+    <span>音频chunks: <b id="statAudioChunks">-</b></span>
+    <span>音频时长: <b id="statAudioDur">-</b></span>
+  </div>
+</div>
+
+<script>
+// ==================== 配置 ====================
+const API = '';  // 同源，由 FastAPI adapter 服务
+const RECORD_SAMPLE_RATE = 16000;
+const PLAYBACK_SAMPLE_RATE = 24000;
+const AUDIO_POLL_INTERVAL_MS = 500;  // 音频轮询间隔
+
+// ==================== DOM ====================
+const $ = (id) => document.getElementById(id);
+const $status = $('status');
+const $chat   = $('chat');
+const $audioProgress = $('audioProgress');
+
+const $btnInit  = $('btnInit');
+const $btnRec   = $('btnRecord');
+const $btnStp   = $('btnStop');
+const $btnAbort = $('btnAbort');  // may be null (button disabled)
+const $btnRst   = $('btnReset');
+
+const $ttft       = $('statTTFT');
+const $textDone   = $('statTextDone');
+const $audioChunks = $('statAudioChunks');
+const $audioDur   = $('statAudioDur');
+
+// ==================== 状态 ====================
+let mediaStream = null;
+let audioCtx = null;
+let playbackCtx = null;
+let recorder = null;
+let recordedChunks = [];
+let isRecording = false;
+let isGenerating = false;
+let abortController = null;
+let audioPollingActive = false;
+
+// ==================== 初始化引擎 ====================
+async function initEngine() {
+  $btnInit.disabled = true;
+  $status.textContent = '初始化引擎中... (首次约 30-60s)';
+  try {
+    const resp = await fetch(`${API}/init`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ media_type: 1, duplex_mode: false }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      $status.textContent = '引擎就绪，可以录音';
+      $btnRec.disabled = false;
+      $btnRst.disabled = false;
+    } else {
+      $status.textContent = `初始化失败: ${JSON.stringify(data)}`;
+      $btnInit.disabled = false;
+    }
+  } catch (e) {
+    $status.textContent = `初始化异常: ${e.message}`;
+    $btnInit.disabled = false;
+  }
+}
+
+async function checkHealth() {
+  try {
+    const resp = await fetch(`${API}/health`);
+    const data = await resp.json();
+    if (data.status === 'healthy') {
+      $status.textContent = data.initialized
+        ? '引擎就绪，可以录音'
+        : '后端已连接，请点击「初始化引擎」';
+      $btnInit.disabled = data.initialized;
+      $btnRec.disabled = !data.initialized;
+      $btnRst.disabled = !data.initialized;
+    } else {
+      $status.textContent = '后端不可用';
+    }
+  } catch (e) {
+    $status.textContent = `连接失败: ${e.message}（确认 llama-server 和 adapter 已启动）`;
+  }
+}
+
+// ==================== 重置对话 ====================
+async function resetConversation() {
+  if (isGenerating) return;
+  $btnRst.disabled = true;
+  try {
+    const resp = await fetch(`${API}/reset`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const data = await resp.json();
+    if (data.success) {
+      $chat.innerHTML = '';
+      appendChat('system', '— 新对话 —');
+      resetStats();
+      $status.textContent = '对话已重置';
+    } else {
+      $status.textContent = `重置失败: ${JSON.stringify(data)}`;
+    }
+  } catch (e) {
+    $status.textContent = `重置异常: ${e.message}`;
+  }
+  $btnRst.disabled = false;
+}
+
+function resetStats() {
+  $ttft.textContent = '-';
+  $textDone.textContent = '-';
+  $audioChunks.textContent = '-';
+  $audioDur.textContent = '-';
+  $audioProgress.textContent = '';
+}
+
+// ==================== 录音 (16kHz mono 16bit WAV) ====================
+async function startRecording() {
+  if (isRecording || isGenerating) return;
+  recordedChunks = [];
+
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: RECORD_SAMPLE_RATE, channelCount: 1, echoCancellation: true }
+    });
+  } catch (e) {
+    $status.textContent = `麦克风权限被拒绝: ${e.message}`;
+    return;
+  }
+
+  audioCtx = new AudioContext({ sampleRate: RECORD_SAMPLE_RATE });
+  const source = audioCtx.createMediaStreamSource(mediaStream);
+  recorder = audioCtx.createScriptProcessor(4096, 1, 1);
+  recorder.onaudioprocess = (e) => {
+    const data = e.inputBuffer.getChannelData(0);
+    recordedChunks.push(new Float32Array(data));
+  };
+  source.connect(recorder);
+  recorder.connect(audioCtx.destination);
+
+  isRecording = true;
+  $btnRec.classList.add('recording');
+  $btnRec.disabled = true;
+  $btnStp.disabled = false;
+  $btnRst.disabled = true;
+  $status.textContent = '录音中...';
+}
+
+function stopRecording() {
+  if (!isRecording) return;
+  isRecording = false;
+  recorder.disconnect();
+  mediaStream.getTracks().forEach(t => t.stop());
+  audioCtx.close();
+
+  $btnRec.classList.remove('recording');
+  $btnStp.disabled = true;
+
+  const totalLen = recordedChunks.reduce((s, c) => s + c.length, 0);
+  const merged = new Float32Array(totalLen);
+  let offset = 0;
+  for (const chunk of recordedChunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  const wavBytes = encodeWAV(merged, RECORD_SAMPLE_RATE);
+  const wavB64 = arrayBufferToBase64(wavBytes);
+
+  $status.textContent = `录音 ${(totalLen / RECORD_SAMPLE_RATE).toFixed(1)}s，发送中...`;
+  sendAndGenerate(wavB64);
+}
+
+function encodeWAV(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (off, str) => { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buffer;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+// ==================== Prefill + Generate + Audio Poll ====================
+async function sendAndGenerate(wavB64) {
+  const t0 = performance.now();
+  isGenerating = true;
+  abortController = new AbortController();
+  $btnRec.disabled = true;
+  $btnRst.disabled = true;
+  if ($btnAbort) $btnAbort.disabled = false;
+  resetStats();
+
+  appendChat('user', '[语音输入]');
+
+  try {
+    // 1. Prefill
+    $status.textContent = 'Prefill 中...';
+    const prefillResp = await fetch(`${API}/prefill`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: wavB64 }),
+    });
+    const prefillData = await prefillResp.json();
+    if (!prefillData.success) {
+      $status.textContent = `Prefill 失败: ${JSON.stringify(prefillData)}`;
+      finishGeneration();
+      return;
+    }
+
+    // 2. Generate (SSE text stream)
+    $status.textContent = '生成中 (文本流)...';
+    const genResp = await fetch(`${API}/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+      signal: abortController.signal,
+    });
+    const reader = genResp.body.getReader();
+    const decoder = new TextDecoder();
+
+    let assistantText = '';
+    const assistantEl = appendChat('assistant', '');
+    let firstTextTime = null;
+    let sseBuffer = '';
+    let roundIdx = -1;
+    let audioPromise = null;  // 音频 polling 并行 promise
+
+    // 读 SSE 流
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+
+      while (sseBuffer.includes('\n\n')) {
+        const idx = sseBuffer.indexOf('\n\n');
+        const block = sseBuffer.substring(0, idx);
+        sseBuffer = sseBuffer.substring(idx + 2);
+
+        for (const line of block.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.substring(6);
+
+          if (payload === '[DONE]') continue;
+
+          try {
+            const data = JSON.parse(payload);
+
+            // 文本事件 (server.cpp 格式)
+            if (data.content && !data.stop) {
+              if (!firstTextTime) firstTextTime = performance.now();
+              assistantText += data.content;
+              assistantEl.textContent = assistantText;
+              $chat.scrollTop = $chat.scrollHeight;
+            }
+
+            // 元数据 (adapter 注入的 round_idx) — 收到后立即并行启动音频 polling
+            if (data.meta && !audioPromise) {
+              const meta = typeof data.meta === 'string' ? JSON.parse(data.meta) : data.meta;
+              roundIdx = meta.round_idx;
+              if (roundIdx >= 0) {
+                audioPromise = loadAudioProgressively(roundIdx, t0);
+              }
+            }
+          } catch (e) { /* ignore parse errors */ }
+        }
+      }
+    }
+
+    const tTextDone = performance.now();
+    const ttft = firstTextTime ? ((firstTextTime - t0) / 1000).toFixed(1) : '-';
+    $ttft.textContent = `${ttft}s`;
+    $textDone.textContent = `${((tTextDone - t0) / 1000).toFixed(1)}s`;
+
+    // 3. 等待音频 polling 完成（已在 SSE 流中并行启动）
+    if (audioPromise) {
+      await audioPromise;
+    } else if (roundIdx >= 0) {
+      // SSE 流结束前未收到 meta，fallback 启动 polling
+      $status.textContent = '加载音频中...';
+      await loadAudioProgressively(roundIdx, t0);
+    } else {
+      $status.textContent = '文本生成完成 (无音频 round 信息)';
+    }
+
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      $status.textContent = '已打断';
+      appendChat('system', '[用户打断]');
+    } else {
+      $status.textContent = `错误: ${e.message}`;
+    }
+  }
+
+  finishGeneration();
+}
+
+// ==================== 音频渐进加载 ====================
+async function loadAudioProgressively(roundIdx, t0) {
+  // 初始化 playback context
+  if (!playbackCtx || playbackCtx.state === 'closed') {
+    playbackCtx = new AudioContext({ sampleRate: PLAYBACK_SAMPLE_RATE });
+  }
+  if (playbackCtx.state === 'suspended') {
+    await playbackCtx.resume();
+  }
+
+  let nextPlayTime = playbackCtx.currentTime;
+  let totalAudioDur = 0;
+  let audioChunkCount = 0;
+  let fromIdx = 0;
+  let done = false;
+  let retries = 0;
+  const MAX_RETRIES = 30;  // 最多等 15s (30 * 500ms)，T2W 通常在 LLM 结束后几秒内完成
+
+  audioPollingActive = true;
+
+  while (!done && retries < MAX_RETRIES && audioPollingActive) {
+    try {
+      const resp = await fetch(`${API}/audio/poll?round_idx=${roundIdx}&from_idx=${fromIdx}&_t=${Date.now()}`);
+      const data = await resp.json();
+
+      // 加载新文件
+      for (const file of data.files) {
+        try {
+          // cache-busting: 避免浏览器返回旧的缓存 WAV
+          const wavResp = await fetch(file.url + '&_t=' + Date.now());
+          const wavBuffer = await wavResp.arrayBuffer();
+
+          // 解码 WAV → AudioBuffer
+          const audioBuf = await playbackCtx.decodeAudioData(wavBuffer);
+
+          // 排队播放
+          const src = playbackCtx.createBufferSource();
+          src.buffer = audioBuf;
+          src.connect(playbackCtx.destination);
+
+          const now = playbackCtx.currentTime;
+          if (nextPlayTime < now) nextPlayTime = now;
+          src.start(nextPlayTime);
+          nextPlayTime += audioBuf.duration;
+          totalAudioDur += audioBuf.duration;
+          audioChunkCount++;
+
+          $audioChunks.textContent = audioChunkCount;
+          $audioDur.textContent = `${totalAudioDur.toFixed(1)}s`;
+          $audioProgress.textContent = `音频 chunk ${audioChunkCount} 已加载 (${totalAudioDur.toFixed(1)}s)`;
+
+        } catch (e) {
+          console.warn(`Failed to load audio ${file.url}:`, e);
+        }
+      }
+
+      fromIdx = data.next_from;
+      done = data.done;
+
+      if (data.files.length === 0 && !done) {
+        retries++;
+      } else {
+        retries = 0;  // 有新文件就重置
+      }
+
+    } catch (e) {
+      console.warn('Audio poll error:', e);
+      retries++;
+    }
+
+    if (!done) {
+      await sleep(AUDIO_POLL_INTERVAL_MS);
+    }
+  }
+
+  audioPollingActive = false;
+
+  // 如果是被打断退出的，不覆盖 "已打断" 状态
+  if (!audioPollingActive && abortInProgress === false && !done) {
+    // 被 abortGeneration() 中断，保持 "已打断" 状态不覆盖
+    return;
+  }
+
+  if (done) {
+    // 等待播放完毕
+    if (playbackCtx && playbackCtx.state !== 'closed') {
+      const remaining = nextPlayTime - playbackCtx.currentTime;
+      if (remaining > 0) {
+        $status.textContent = `播放中... 剩余 ${remaining.toFixed(1)}s`;
+        $audioProgress.textContent = `全部 ${audioChunkCount} 个音频已加载，播放中...`;
+        await sleep(remaining * 1000);
+      }
+    }
+    $status.textContent = `完成 | ${audioChunkCount} 段音频 | ${totalAudioDur.toFixed(1)}s`;
+    $audioProgress.textContent = `播放完成: ${audioChunkCount} chunks, ${totalAudioDur.toFixed(1)}s`;
+  } else if (audioChunkCount > 0) {
+    $status.textContent = `音频加载超时，已播放 ${audioChunkCount} 段`;
+  } else {
+    $status.textContent = '文本生成完成 (等待音频超时，可能 T2W 未启用)';
+    $audioProgress.textContent = '';
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ==================== 打断 ====================
+let abortInProgress = false;  // 防抖：避免重复发送 break 请求
+async function abortGeneration() {
+  if (!isGenerating || abortInProgress) return;
+  abortInProgress = true;
+  if ($btnAbort) $btnAbort.disabled = true;
+
+  // 1. 立即停止前端：abort SSE + 停止音频 polling + 停止播放
+  audioPollingActive = false;
+  if (abortController) abortController.abort();
+  if (playbackCtx && playbackCtx.state !== 'closed') {
+    try { await playbackCtx.close(); } catch (_) {}
+    playbackCtx = null;
+  }
+
+  // 2. 通知后端停止（fire-and-forget，不阻塞前端）
+  fetch(`${API}/stop`, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: '{}' }).catch(() => {});
+
+  $status.textContent = '已打断';
+  abortInProgress = false;
+}
+
+function finishGeneration() {
+  abortController = null;
+  isGenerating = false;
+  $btnRec.disabled = false;
+  $btnRst.disabled = false;
+  if ($btnAbort) $btnAbort.disabled = true;
+}
+
+// ==================== Chat UI ====================
+function appendChat(role, text) {
+  const el = document.createElement('div');
+  el.className = role;
+  el.textContent = text;
+  $chat.appendChild(el);
+  $chat.scrollTop = $chat.scrollHeight;
+  return el;
+}
+
+// ==================== Events ====================
+$btnInit.addEventListener('click', initEngine);
+$btnRec.addEventListener('click', startRecording);
+$btnStp.addEventListener('click', stopRecording);
+if ($btnAbort) $btnAbort.addEventListener('click', abortGeneration);
+$btnRst.addEventListener('click', resetConversation);
+
+// 页面加载时检查后端
+checkHealth();
+</script>
+
+</body>
+</html>
