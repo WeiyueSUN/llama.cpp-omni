@@ -949,16 +949,13 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     // 🔧 [双工模式] 在采样前调整 logits
     if (ctx_omni->duplex_mode) {
         if (logits != nullptr) {
-            // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
-            // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
-            if (ctx_omni->special_token_listen >= 0) {
-                // 使用 listen_prob_scale 调整 <|listen|> 的 logit
-                // 默认值 1.0 不改变，> 1.0 增加 listen 概率
-                // 这里我们使用加法而不是乘法，因为 logit 可能是负数
-                // 添加一个偏置值来增加 listen 的概率
-                // listen_prob_bias = log(listen_prob_scale) ≈ (listen_prob_scale - 1.0) for small values
-                float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
-                logits[ctx_omni->special_token_listen] += listen_bias;
+            // 1. 🔧 [与 Python 对齐] 调整 <|listen|> 的 logit（listen_prob_scale）
+            // Python (utils.py:2178-2179):
+            //   if listen_prob_scale != 1.0:
+            //       logits[0, self.listen_id] *= listen_prob_scale
+            // 使用乘法，与 Python 完全一致
+            if (ctx_omni->special_token_listen >= 0 && ctx_omni->listen_prob_scale != 1.0f) {
+                logits[ctx_omni->special_token_listen] *= ctx_omni->listen_prob_scale;
             }
             
             // 2. 🔧 [与 Python 对齐] 禁止采样 <|tts_pad|> token
@@ -988,15 +985,31 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     }
     
     const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
-    token_id = id;  // 保存token ID
-    common_sampler_accept(smpl, id, true);
+    
+    // 🔧 [与 Python 对齐] current_turn_ended guard
+    // Python (modeling_minicpmo.py:3230-3232):
+    //   if last_id == listen_token_id and (not self.current_turn_ended):
+    //       last_id = tts_bos_token_id
+    // 当模型说话（turn 未结束）时采样到 <|listen|>，强制替换为 <|tts_bos|> 继续说话
+    // 这防止模型在回复途中过早跳到 listen 状态
+    llama_token actual_id = id;
+    if (ctx_omni->duplex_mode &&
+        actual_id == ctx_omni->special_token_listen &&
+        !ctx_omni->current_turn_ended &&
+        ctx_omni->tts_bos_token_id >= 0) {
+        actual_id = ctx_omni->tts_bos_token_id;
+        print_with_timestamp("🔧 Duplex guard: listen→tts_bos (current_turn_ended=false)\n");
+    }
+    
+    token_id = actual_id;
+    common_sampler_accept(smpl, actual_id, true);
     static std::string ret;
-    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
+    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), actual_id)) {
         ret = "</s>";
     } else {
-        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+        ret = common_token_to_piece(ctx_omni->ctx_llama, actual_id);
     }
-    eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+    eval_id_with_hidden(ctx_omni, params, actual_id, n_past, hidden_states);
     return ret.c_str();
 }
 
@@ -9312,6 +9325,22 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     
                     // Don't add end tokens to response
                     break;
+                }
+
+                // 🔧 [与 Python 对齐] 非终止 token 时设置 current_turn_ended = false
+                // Python (modeling_minicpmo.py:3244-3262):
+                //   else:  # not chunk_terminator
+                //       self.current_turn_ended = False  # 一旦开始说话，turn 未结束
+                //       ...
+                //       end_of_turn = last_id in turn_terminator_token_ids
+                //       if end_of_turn: self.current_turn_ended = True
+                // turn_eos 已在上方设为 true，此处只对非 turn 终止 token 设为 false
+                if (ctx_omni->duplex_mode) {
+                    if (token_type != OmniTokenType::TURN_EOS &&
+                        token_type != OmniTokenType::TTS_EOS &&
+                        token_type != OmniTokenType::EOS) {
+                        ctx_omni->current_turn_ended = false;
+                    }
                 }
 
                 // Copy tmp to a local string immediately to avoid issues with static string

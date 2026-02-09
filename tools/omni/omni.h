@@ -234,7 +234,9 @@ struct omni_context {
     // ==================== 双工模式参数 ====================
     // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
     // 设置为 0 表示无限制
-    int max_new_speak_tokens_per_chunk = 26;
+    // 🔧 [与 Python 对齐] Python 默认 20，此处降为 10 以减少双工 SPEAK tick 延迟
+    // ⚡ Layer 2: 20 -> 10，每 chunk LLM 时间 1200ms -> 600ms
+    int max_new_speak_tokens_per_chunk = 10;
     
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认
