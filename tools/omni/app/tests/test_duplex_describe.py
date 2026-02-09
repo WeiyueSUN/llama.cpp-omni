@@ -2,9 +2,9 @@
 
 流程 (与 HF duplex demo 对齐):
   每 1s 一个 tick，共 20 tick:
-    1. prefill(1s audio_chunk + image)
-    2. generate() → 收集一个 chunk (≤20 LLM tokens, 对应 ~1s TTS 音频)
-  总计 20 次 prefill + 20 次 generate
+    使用 /omni/duplex_tick 合并 endpoint (prefill + generate 单次 HTTP 调用)
+    → 收集一个 chunk (≤10 LLM tokens)
+  总计 20 次 duplex_tick 调用
 
 输入:
   - 音频: user_query_description_camera.wav (2.46s, "实时描述画面中的内容")，0s 开始，之后静音
@@ -230,30 +230,22 @@ def prepare_audio_chunks(audio_path: str) -> List[Tuple[str, np.ndarray]]:
     return chunks
 
 
-# ==================== 核心: prefill + generate 一个 tick ====================
+# ==================== 核心: 单次 duplex tick (prefill + generate 合并) ====================
 
-def do_prefill(state: TestState, tick_idx: int,
-               audio_b64: str, image_b64: str, img_tag: str) -> float:
-    """执行一次 prefill，返回耗时 ms"""
+def do_tick(state: TestState, tick_idx: int,
+            audio_b64: str, image_b64: str, img_tag: str,
+            ) -> Tuple[str, bool, List[bytes], float, float]:
+    """执行一次 duplex_tick (prefill + generate 合并为单次 HTTP 调用)
+
+    使用 /omni/duplex_tick endpoint，省去一次 HTTP round-trip。
+
+    Returns:
+        (text, is_listen, audio_chunks, audio_dur_s, total_ms)
+    """
     t0 = time.time()
     resp = requests.post(
-        f"{SERVER_URL}/omni/streaming_prefill",
+        f"{SERVER_URL}/omni/duplex_tick",
         json={"audio": audio_b64, "image": image_b64},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    ms = (time.time() - t0) * 1000
-    state.log("PREFILL", f"tick#{tick_idx} {img_tag} -> {ms:.0f}ms")
-    return ms
-
-
-def do_generate(state: TestState, tick_idx: int) -> Tuple[str, bool, List[bytes], float]:
-    """执行一次 generate (SSE)，返回 (text, is_listen, audio_chunks, audio_dur_s)
-
-    对应 HF 的一次 streaming_generate() 调用 = 一个 chunk (≤20 LLM tokens)
-    """
-    resp = requests.post(
-        f"{SERVER_URL}/omni/streaming_generate",
         headers={"Accept": "text/event-stream"},
         stream=True,
         timeout=TIMEOUT,
@@ -304,15 +296,16 @@ def do_generate(state: TestState, tick_idx: int) -> Tuple[str, bool, List[bytes]
                 except json.JSONDecodeError:
                     pass
 
+    total_ms = (time.time() - t0) * 1000
     full_text = "".join(texts)
-    return full_text, is_listen, audio_chunks, total_audio_s
+    return full_text, is_listen, audio_chunks, total_audio_s, total_ms
 
 
 # ==================== 主循环: 20 ticks ====================
 
 def run_ticks(state: TestState, audio_chunks: List[Tuple[str, np.ndarray]],
               image_a_b64: str, image_b_b64: str) -> None:
-    """核心循环: 每 tick 做 prefill → generate，共 TOTAL_TICKS 次"""
+    """核心循环: 每 tick 调用 /omni/duplex_tick (合并 prefill+generate)，共 TOTAL_TICKS 次"""
 
     for tick_idx in range(TOTAL_TICKS):
         tick_wall_start = time.time()
@@ -325,20 +318,17 @@ def run_ticks(state: TestState, audio_chunks: List[Tuple[str, np.ndarray]],
 
         state.log("TICK_START", f"tick#{tick_idx} {label} {img_tag}")
 
-        # 1. prefill
-        prefill_ms = do_prefill(state, tick_idx, audio_b64, image_b64, img_tag)
+        # 单次 HTTP 调用: prefill + generate
+        text, is_listen, audio_pcms, audio_dur, tick_ms = do_tick(
+            state, tick_idx, audio_b64, image_b64, img_tag,
+        )
 
-        # 2. generate
-        gen_t0 = time.time()
-        text, is_listen, audio_pcms, audio_dur = do_generate(state, tick_idx)
-        gen_ms = (time.time() - gen_t0) * 1000
-
-        # 记录结果
+        # 记录结果 (prefill_ms 不再单独可测，合入 tick_ms)
         tick = TickResult(
             tick_idx=tick_idx,
             tick_start_s=round(tick_start_s, 2),
-            prefill_ms=round(prefill_ms, 1),
-            generate_ms=round(gen_ms, 1),
+            prefill_ms=0.0,  # 合并 endpoint 无法拆分
+            generate_ms=round(tick_ms, 1),  # 整个 tick 耗时
             text=text,
             is_listen=is_listen,
             audio_chunks=audio_pcms,
@@ -347,9 +337,7 @@ def run_ticks(state: TestState, audio_chunks: List[Tuple[str, np.ndarray]],
         )
         state.ticks.append(tick)
 
-        tick_total_ms = (time.time() - tick_wall_start) * 1000
-
-        detail = f"tick#{tick_idx}: {tick_total_ms:.0f}ms (prefill={prefill_ms:.0f} + gen={gen_ms:.0f})"
+        detail = f"tick#{tick_idx}: {tick_ms:.0f}ms"
         if text:
             detail += f' | "{text[:40]}"'
         if is_listen:
@@ -512,7 +500,7 @@ def synthesize_mp4(user_audio_path: str, ai_pcm_timeline: bytes,
 
 def main() -> None:
     print("=" * 70)
-    print("双工描述画面测试 (tick-based: 每 tick = 1 prefill + 1 generate)")
+    print("双工描述画面测试 (tick-based: 每 tick = 1 duplex_tick 调用)")
     print(f"服务器: {SERVER_URL}")
     print(f"用户音频: {USER_AUDIO}")
     print(f"总 tick 数: {TOTAL_TICKS} (每 tick {SEND_INTERVAL_S}s)")
@@ -564,7 +552,7 @@ def main() -> None:
     state.stream_start_time = time.time()
 
     print(f"\n{'=' * 70}")
-    print(f"开始 {TOTAL_TICKS} 个 tick (每 tick: prefill → generate)")
+    print(f"开始 {TOTAL_TICKS} 个 tick (每 tick: /omni/duplex_tick 合并调用)")
     print(f"{'=' * 70}")
 
     run_ticks(state, audio_chunks, image_a_b64, image_b_b64)
@@ -592,14 +580,18 @@ def main() -> None:
     print(f"  模型输出: {total_text[:200]}")
 
     # per-tick 时间分布
-    prefill_times = [t.prefill_ms for t in state.ticks]
-    gen_times = [t.generate_ms for t in state.ticks]
-    print(f"\n  Prefill: avg={np.mean(prefill_times):.0f}ms, "
-          f"min={np.min(prefill_times):.0f}ms, max={np.max(prefill_times):.0f}ms")
-    print(f"  Generate: avg={np.mean(gen_times):.0f}ms, "
-          f"min={np.min(gen_times):.0f}ms, max={np.max(gen_times):.0f}ms")
-    print(f"  Tick 平均: {np.mean([t.prefill_ms + t.generate_ms for t in state.ticks]):.0f}ms "
-          f"(目标: ≤1000ms 实时)")
+    tick_times = [t.generate_ms for t in state.ticks]  # generate_ms = 整个 tick 耗时
+    listen_times = [t.generate_ms for t in state.ticks if t.is_listen]
+    speak_times = [t.generate_ms for t in state.ticks if not t.is_listen]
+    print(f"\n  Tick 总体: avg={np.mean(tick_times):.0f}ms, "
+          f"min={np.min(tick_times):.0f}ms, max={np.max(tick_times):.0f}ms")
+    if listen_times:
+        print(f"  LISTEN ticks: avg={np.mean(listen_times):.0f}ms, "
+              f"min={np.min(listen_times):.0f}ms, max={np.max(listen_times):.0f}ms")
+    if speak_times:
+        print(f"  SPEAK ticks: avg={np.mean(speak_times):.0f}ms, "
+              f"min={np.min(speak_times):.0f}ms, max={np.max(speak_times):.0f}ms")
+    print(f"  目标: ≤1000ms/tick 实现实时")
 
     # 保存
     print(f"\n{'=' * 70}")
