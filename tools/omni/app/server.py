@@ -476,7 +476,14 @@ async def streaming_generate(request: Request):
         - text 事件: LLM 每生成 10 个有效 token 触发一次
         - tts_chunk 事件: TTS 完成一个 text chunk 的 speech token 生成时触发
         - audio 事件: T2W 每产出 ~1s PCM 触发一次
+
+        尾部等待策略 (单工/双工分开):
+        - 单工: decode 结束后 T2W 可能还在异步产出音频，idle-timeout 2s，最长 60s
+        - 双工: 每次 decode = 一个 chunk，LISTEN 无音频产出立即结束，
+                SPEAK chunk 用短 timeout (0.3s) 快速收尾
         """
+        is_listen = False  # 追踪本轮是否以 listen 结束
+
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=0.05)
@@ -491,6 +498,7 @@ async def streaming_generate(request: Request):
             elif item[0] == "text":
                 text = item[1]
                 if text == "__IS_LISTEN__":
+                    is_listen = True
                     yield f"data: {json.dumps({'is_listen': True})}\n\n"
                 elif text == "__END_OF_TURN__":
                     pass  # 由 "done" 信号处理
@@ -531,45 +539,266 @@ async def streaming_generate(request: Request):
                 yield f"data: {json.dumps({'error': item[1]})}\n\n"
                 break
 
-        # 等待剩余音频（decode 结束后 T2W 线程可能还在产出）
-        # idle-timeout: 收到事件就续期，连续 2s 无事件才退出，最长等 60s
-        tail_max = time.time() + 60.0
-        idle_timeout = 2.0
-        while time.time() < tail_max:
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
-                if item[0] == "audio":
-                    pcm_bytes = item[1]
-                    n_input_tokens = item[3]
-                    wav_b64 = base64.b64encode(pcm_bytes).decode("ascii")
-                    event = json.dumps({
-                        "chunk_data": {
-                            "wav": wav_b64, "sample_rate": 24000, "text": "",
-                            "n_input_tokens": n_input_tokens,
-                        }
-                    }, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-                elif item[0] == "tts_chunk":
-                    tts_text = item[1]
-                    n_speech_tokens = item[2]
-                    chunk_idx = item[3]
-                    event = json.dumps({
-                        "tts_chunk": {
-                            "text": tts_text,
-                            "n_speech_tokens": n_speech_tokens,
-                            "chunk_idx": chunk_idx,
-                            "audio_duration_ms": n_speech_tokens * 40,
-                        }
-                    }, ensure_ascii=False)
-                    yield f"data: {event}\n\n"
-                elif item[0] == "done":
-                    break
-            except asyncio.TimeoutError:
-                break  # 连续 idle_timeout 秒无事件，T2W 已完成
+        # ==================== 尾部等待: 单工/双工分开 ====================
+        if STATE.duplex_mode:
+            # 双工模式: 每次 decode = 一个 chunk
+            # - LISTEN: 无音频产出，跳过尾部等待
+            # - SPEAK: TTS+T2W 对单个 chunk 的处理应在主循环内完成，
+            #          短 timeout 兜底即可
+            if is_listen:
+                pass  # 无需等待
+            else:
+                # SPEAK chunk: 短 timeout 收集可能的尾部音频
+                tail_timeout = 0.1  # ⚡ Layer 1b: 从 0.3s 降到 0.1s
+                try:
+                    while True:
+                        item = await asyncio.wait_for(queue.get(), timeout=tail_timeout)
+                        if item[0] == "audio":
+                            pcm_bytes = item[1]
+                            n_input_tokens = item[3]
+                            wav_b64 = base64.b64encode(pcm_bytes).decode("ascii")
+                            event = json.dumps({
+                                "chunk_data": {
+                                    "wav": wav_b64, "sample_rate": 24000, "text": "",
+                                    "n_input_tokens": n_input_tokens,
+                                }
+                            }, ensure_ascii=False)
+                            yield f"data: {event}\n\n"
+                        elif item[0] == "tts_chunk":
+                            tts_text = item[1]
+                            n_speech_tokens = item[2]
+                            chunk_idx = item[3]
+                            event = json.dumps({
+                                "tts_chunk": {
+                                    "text": tts_text,
+                                    "n_speech_tokens": n_speech_tokens,
+                                    "chunk_idx": chunk_idx,
+                                    "audio_duration_ms": n_speech_tokens * 40,
+                                }
+                            }, ensure_ascii=False)
+                            yield f"data: {event}\n\n"
+                        elif item[0] == "done":
+                            break
+                except asyncio.TimeoutError:
+                    pass  # 0.3s 无事件，收尾
+        else:
+            # 单工模式: decode 结束后 T2W 线程可能还在异步产出大量音频
+            # idle-timeout 2s: 收到事件续期，连续 2s 无事件才退出，最长 60s
+            tail_max = time.time() + 60.0
+            idle_timeout = 2.0
+            while time.time() < tail_max:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+                    if item[0] == "audio":
+                        pcm_bytes = item[1]
+                        n_input_tokens = item[3]
+                        wav_b64 = base64.b64encode(pcm_bytes).decode("ascii")
+                        event = json.dumps({
+                            "chunk_data": {
+                                "wav": wav_b64, "sample_rate": 24000, "text": "",
+                                "n_input_tokens": n_input_tokens,
+                            }
+                        }, ensure_ascii=False)
+                        yield f"data: {event}\n\n"
+                    elif item[0] == "tts_chunk":
+                        tts_text = item[1]
+                        n_speech_tokens = item[2]
+                        chunk_idx = item[3]
+                        event = json.dumps({
+                            "tts_chunk": {
+                                "text": tts_text,
+                                "n_speech_tokens": n_speech_tokens,
+                                "chunk_idx": chunk_idx,
+                                "audio_duration_ms": n_speech_tokens * 40,
+                            }
+                        }, ensure_ascii=False)
+                        yield f"data: {event}\n\n"
+                    elif item[0] == "done":
+                        break
+                except asyncio.TimeoutError:
+                    break  # 连续 idle_timeout 秒无事件，T2W 已完成
 
         yield "data: [DONE]\n\n"
 
         # SSE 完全结束后清除 C++ 回调引用
+        if STATE.engine is not None:
+            STATE.engine.clear_callbacks()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/omni/duplex_tick")
+async def duplex_tick(request: Request):
+    """双工单次 tick: prefill(audio+image) -> decode(one_chunk) -> SSE
+
+    合并 streaming_prefill + streaming_generate 为单次 HTTP 调用，
+    省去一次 HTTP round-trip (~50-100ms per tick)。
+
+    Body:
+        audio: base64 编码的 WAV 音频 (1s chunk)
+        image: base64 编码的 PNG/JPEG 图像 (可选)
+
+    返回 SSE 事件流 (与 streaming_generate 格式相同):
+        data: {"chunk_data": {"text": "...", "wav": "", ...}}
+        data: {"chunk_data": {"wav": "<base64>", ...}}
+        data: {"is_listen": true}
+        data: [DONE]
+    """
+    if not STATE.initialized or STATE.engine is None:
+        return JSONResponse({"error": "engine not initialized"}, status_code=400)
+
+    body = await request.json()
+    audio_b64: str = body.get("audio", "")
+    image_b64: str = body.get("image", "")
+
+    # --- Phase 1: prefill ---
+    with STATE.lock:
+        idx = STATE.prefill_counter
+        STATE.prefill_counter += 1
+
+    audio_bytes: bytes = b""
+    image_bytes: bytes = b""
+
+    if audio_b64:
+        raw_audio = base64.b64decode(audio_b64)
+        if raw_audio[:4] == b"RIFF" and raw_audio[8:12] == b"WAVE":
+            audio_bytes = raw_audio
+        else:
+            audio_bytes = _pcm_float32_to_wav_bytes(raw_audio)
+
+    if image_b64:
+        image_bytes = base64.b64decode(image_b64)
+
+    prefill_index = idx + 1
+    loop = asyncio.get_event_loop()
+
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: STATE.engine.prefill_from_memory(
+                audio_bytes, image_bytes, prefill_index, -1
+            ),
+        )
+    except Exception as e:
+        logger.error(f"duplex_tick prefill 失败: {e}")
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+    # --- Phase 2: decode (SSE streaming) ---
+    # 等待上一轮 decode 线程完成
+    if STATE.decode_thread is not None and STATE.decode_thread.is_alive():
+        await loop.run_in_executor(None, STATE.decode_thread.join, 5.0)
+        STATE.decode_thread = None
+
+    queue: asyncio.Queue = asyncio.Queue()
+    decode_done = asyncio.Event()
+
+    def on_text(text: str) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("text", text))
+
+    def on_audio(pcm_bytes: bytes, wav_idx: int, n_input_tokens: int) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("audio", pcm_bytes, wav_idx, n_input_tokens))
+
+    def on_tts_chunk(text: str, n_speech_tokens: int, chunk_idx: int) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, ("tts_chunk", text, n_speech_tokens, chunk_idx))
+
+    def run_decode() -> None:
+        try:
+            STATE.engine.decode(
+                on_text=on_text,
+                on_audio=on_audio,
+                on_tts_chunk=on_tts_chunk,
+                debug_dir=STATE.output_dir,
+                round_idx=-1,
+            )
+        except Exception as e:
+            logger.error(f"duplex_tick decode 异常: {e}")
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+        finally:
+            loop.call_soon_threadsafe(decode_done.set)
+            loop.call_soon_threadsafe(queue.put_nowait, ("done",))
+
+    decode_thread = threading.Thread(target=run_decode, name="duplex_tick_worker", daemon=True)
+    decode_thread.start()
+    STATE.decode_thread = decode_thread
+
+    async def event_generator():
+        is_listen = False
+
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=0.05)
+            except asyncio.TimeoutError:
+                if decode_done.is_set() and queue.empty():
+                    break
+                continue
+
+            if item[0] == "done":
+                break
+            elif item[0] == "text":
+                text = item[1]
+                if text == "__IS_LISTEN__":
+                    is_listen = True
+                    yield f"data: {json.dumps({'is_listen': True})}\n\n"
+                elif text == "__END_OF_TURN__":
+                    pass
+                else:
+                    event = json.dumps({
+                        "chunk_data": {"text": text, "wav": "", "sample_rate": 24000}
+                    }, ensure_ascii=False)
+                    yield f"data: {event}\n\n"
+            elif item[0] == "tts_chunk":
+                event = json.dumps({
+                    "tts_chunk": {
+                        "text": item[1],
+                        "n_speech_tokens": item[2],
+                        "chunk_idx": item[3],
+                        "audio_duration_ms": item[2] * 40,
+                    }
+                }, ensure_ascii=False)
+                yield f"data: {event}\n\n"
+            elif item[0] == "audio":
+                wav_b64 = base64.b64encode(item[1]).decode("ascii")
+                event = json.dumps({
+                    "chunk_data": {
+                        "wav": wav_b64, "sample_rate": 24000, "text": "",
+                        "n_input_tokens": item[3],
+                    }
+                }, ensure_ascii=False)
+                yield f"data: {event}\n\n"
+            elif item[0] == "error":
+                yield f"data: {json.dumps({'error': item[1]})}\n\n"
+                break
+
+        # 双工尾部等待: LISTEN 跳过, SPEAK 短 timeout
+        if not is_listen:
+            tail_timeout = 0.1  # Layer 1b: 0.1s (比 streaming_generate 的 0.3s 更短)
+            try:
+                while True:
+                    item = await asyncio.wait_for(queue.get(), timeout=tail_timeout)
+                    if item[0] == "audio":
+                        wav_b64 = base64.b64encode(item[1]).decode("ascii")
+                        event = json.dumps({
+                            "chunk_data": {
+                                "wav": wav_b64, "sample_rate": 24000, "text": "",
+                                "n_input_tokens": item[3],
+                            }
+                        }, ensure_ascii=False)
+                        yield f"data: {event}\n\n"
+                    elif item[0] in ("done",):
+                        break
+            except asyncio.TimeoutError:
+                pass
+
+        yield "data: [DONE]\n\n"
+
         if STATE.engine is not None:
             STATE.engine.clear_callbacks()
 
